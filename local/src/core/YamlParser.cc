@@ -7,6 +7,7 @@
 
 #include "core/YamlParser.h"
 #include "core/ProxyVerifier.h"
+#include "core/verification.h"
 
 #include "core/Localizer.h"
 #include "core/yaml_util.h"
@@ -27,13 +28,62 @@ using namespace swoc::literals;
 using namespace std::literals;
 
 using std::chrono::duration_cast;
-using std::chrono::milliseconds;
-using std::chrono::nanoseconds;
 using std::chrono::seconds;
+using std::chrono::milliseconds;
+using std::chrono::microseconds;
+using std::chrono::nanoseconds;
 using ClockType = std::chrono::system_clock;
 using TimePoint = std::chrono::time_point<ClockType, nanoseconds>;
 
 TimePoint YamlParser::_parsing_start_time{};
+
+swoc::Rv<microseconds>
+interpret_delay_string(TextView src)
+{
+  auto delay = src;
+  delay = delay.trim_if(&isspace);
+  auto delay_digits = delay.clip_prefix_of(&isdigit);
+  if (delay_digits.empty()) {
+    return {0us, Errata().error(R"(No digits found for delay specification: "{}")", src)};
+  }
+  auto const raw_delay_number = swoc::svtou(delay_digits);
+
+  // The digits prefix was clipped from delay above via clip_prefix_of.
+  auto delay_suffix = delay;
+  delay_suffix = delay_suffix.trim_if(&isspace);
+  if (delay_suffix.empty()) {
+    return {0us, Errata().error(R"(No unit found for delay specification: "{}")", src)};
+  }
+
+  if (delay_suffix == MICROSECONDS_SUFFIX) {
+    return microseconds{raw_delay_number};
+  } else if (delay_suffix == MILLISECONDS_SUFFIX) {
+    return duration_cast<microseconds>(milliseconds{raw_delay_number});
+  } else if (delay_suffix == SECONDS_SUFFIX) {
+    return duration_cast<microseconds>(seconds{raw_delay_number});
+  }
+  return {
+      0us,
+      Errata()
+          .error(R"(Unrecognized unit, "{}", for delay specification: "{}")", delay_suffix, src)};
+}
+
+swoc::Rv<microseconds>
+get_delay_time(YAML::Node const &node)
+{
+  swoc::Rv<microseconds> zret;
+  if (node[YAML_TIME_DELAY_KEY]) {
+    auto delay_node{node[YAML_TIME_DELAY_KEY]};
+    if (delay_node.IsScalar()) {
+      auto &&[delay, delay_errata] = interpret_delay_string(delay_node.Scalar());
+      zret.note(std::move(delay_errata));
+      zret = delay;
+    } else {
+      zret.error(R"("{}" key that is not a scalar.)", YAML_TIME_DELAY_KEY);
+    }
+  }
+  return zret;
+}
 
 Errata
 YamlParser::populate_http_message(YAML::Node const &node, HttpHeader &message)
@@ -79,7 +129,7 @@ YamlParser::populate_http_message(YAML::Node const &node, HttpHeader &message)
   }
 
   if (node[YAML_HTTP_STATUS_KEY]) {
-    message._is_response = true;
+    message.set_is_response();
     auto status_node{node[YAML_HTTP_STATUS_KEY]};
     if (status_node.IsScalar()) {
       TextView text{status_node.Scalar()};
@@ -119,7 +169,7 @@ YamlParser::populate_http_message(YAML::Node const &node, HttpHeader &message)
     auto method_node{node[YAML_HTTP_METHOD_KEY]};
     if (method_node.IsScalar()) {
       message._method = Localizer::localize(method_node.Scalar());
-      message._is_request = true;
+      message.set_is_request();
     } else {
       errata.error(
           R"("{}" value at {} must be a string.)",
@@ -217,13 +267,17 @@ YamlParser::populate_http_message(YAML::Node const &node, HttpHeader &message)
         message._content_data = content.data();
         const size_t content_size = content.size();
         message._recorded_content_size = content_size;
+        // Cross check against previously read content-length header, if any.
         if (message._content_length_p) {
           if (message._content_size != content_size) {
             errata.diag(
                 R"(Conflicting sizes for "Content-Length", sending header value {} instead of data value {}.)",
                 message._content_size,
                 content_size);
+            // _content_size will be the value of the Content-Length header.
           }
+        } else {
+          message._content_size = content_size;
         }
       } else if (auto size_node{content_node[YAML_CONTENT_SIZE_KEY]}; size_node) {
         const size_t content_size = swoc::svtou(size_node.Scalar());
@@ -235,12 +289,9 @@ YamlParser::populate_http_message(YAML::Node const &node, HttpHeader &message)
                 R"(Conflicting sizes for "Content-Length", sending header value {} instead of rule value {}.)",
                 message._content_size,
                 content_size);
+            // _content_size will be the value of the Content-Length header.
           }
-        } else if (message._chunked_p) {
-          message._content_size = content_size;
-        } else if (message._is_http2) {
-          // HTTP/2 transactions may, and likely won't, have a Content-Length
-          // header field. And chunked encoding is not allowed in HTTP/2.
+        } else {
           message._content_size = content_size;
         }
       } else {
@@ -304,7 +355,7 @@ YamlParser::parse_url_rules(
     const auto node_size = node.size();
     if (node_size != 2 && node_size != 3) {
       errata.error(
-          "URL rule node at {} is not a sequence of length 2 "
+          "URL rule at {} is not a sequence of length 2 "
           "or 3 as required.",
           node.Mark());
       continue;
@@ -313,12 +364,14 @@ YamlParser::parse_url_rules(
     TextView part_name{Localizer::localize_lower(node[YAML_RULE_KEY_INDEX].Scalar())};
     UrlPart part_id = HttpHeader::parse_url_part(part_name);
     if (part_id == UrlPart::Error) {
-      errata.error("URL rule node at {} has an invalid URL part.", node.Mark());
+      errata.error("URL rule at {} has an invalid URL part.", node.Mark());
       continue;
     }
     const YAML::Node ValueNode{node[YAML_RULE_VALUE_INDEX]};
     if (ValueNode.IsScalar()) {
-      // There's only a single value associated with this URL part.
+      // Legacy support for non-map nodes, not/nocase unsupported
+      // URL part verification rules can't support multiple values,
+      // so there's no IsSequence() case
       TextView value{Localizer::localize(node[YAML_RULE_VALUE_INDEX].Scalar())};
       if (node_size == 2 && assume_equality_rule) {
         fields._url_rules[static_cast<size_t>(part_id)].push_back(
@@ -329,7 +382,7 @@ YamlParser::parse_url_rules(
         std::shared_ptr<RuleCheck> tester = RuleCheck::make_rule_check(part_id, value, rule_type);
         if (!tester) {
           errata.error(
-              "URL rule node at {} does not have a valid directive ({})",
+              "URL rule at {} does not have a valid directive ({})",
               node.Mark(),
               rule_type);
           continue;
@@ -337,36 +390,63 @@ YamlParser::parse_url_rules(
           fields._url_rules[static_cast<size_t>(part_id)].push_back(tester);
         }
       }
-      // No error reported if incorrect length
     } else if (ValueNode.IsMap()) {
       // Verification is specified as a map, such as:
       // - [ path, { value: config/settings.yaml, as: equal } ]
-      TextView value;
-      if (auto const url_value_node{ValueNode[YAML_RULE_VALUE_MAP_KEY]}; url_value_node) {
-        value = Localizer::localize(url_value_node.Scalar());
-      }
-      if (!ValueNode[YAML_RULE_TYPE_MAP_KEY]) {
-        // No verification directive was specified.
-        if (assume_equality_rule) {
-          fields._url_rules[static_cast<size_t>(part_id)].push_back(
-              RuleCheck::make_equality(part_id, value));
+
+      // Get case setting (default false)
+      auto const rule_case_node{ValueNode[YAML_RULE_CASE_MAP_KEY]};
+      bool is_nocase = false;
+      if (rule_case_node && rule_case_node.IsScalar()) {
+        TextView case_str = Localizer::localize(rule_case_node.Scalar());
+        if (case_str == VERIFICATION_DIRECTIVE_IGNORE) {
+          is_nocase = true;
         }
+      }
+
+      // Get rule type for "as: equal" structure, or "not: equal" if "as" fails
+      TextView rule_type;
+      bool is_inverted = false;
+      if (auto const rule_type_node_as = ValueNode[YAML_RULE_TYPE_MAP_KEY]; rule_type_node_as) {
+        rule_type = rule_type_node_as.Scalar();
+      } else if (auto const rule_type_node_not = ValueNode[YAML_RULE_TYPE_MAP_KEY_NOT];
+                 rule_type_node_not)
+      {
+        rule_type = rule_type_node_not.Scalar();
+        is_inverted = true;
+      } else if (assume_equality_rule) {
+        rule_type = VERIFICATION_DIRECTIVE_EQUALS;
+      } else {
+        errata.info(
+            "URL rule at {} ignored: no directive, and equality is not assumed",
+            node.Mark());
+        // Can continue because all URL maps are verification rules, unlike field rules
         continue;
       }
-      TextView rule_type{ValueNode[YAML_RULE_TYPE_MAP_KEY].Scalar()};
-      std::shared_ptr<RuleCheck> tester = RuleCheck::make_rule_check(part_id, value, rule_type);
+
+      TextView value;
+      auto const url_value_node{ValueNode[YAML_RULE_VALUE_MAP_KEY]};
+      if (url_value_node) {
+        if (url_value_node.IsScalar()) {
+          // Single value
+          value = Localizer::localize(url_value_node.Scalar());
+        } else if (url_value_node.IsSequence()) {
+          errata.error("URL rule at {} has multiple values, which is not allowed.", node.Mark());
+          continue;
+        }
+      }
+      std::shared_ptr<RuleCheck> tester =
+          RuleCheck::make_rule_check(part_id, value, rule_type, is_inverted, is_nocase);
+
       if (!tester) {
-        errata.error(
-            "URL rule node at {} does not have a valid directive ({})",
-            node.Mark(),
-            rule_type);
-        continue;
+        errata.error("URL rule at {} does not have a valid directive ({})", node.Mark(), rule_type);
       } else {
         fields._url_rules[static_cast<size_t>(part_id)].push_back(tester);
       }
     } else if (ValueNode.IsSequence()) {
-      errata.error("URL rule node at {} has multiple values, which is not allowed.", node.Mark());
-      continue;
+      errata.error("URL rule at {} has multiple values, which is not allowed.", node.Mark());
+    } else {
+      errata.error("URL rule at {} is null or malformed.", node.Mark());
     }
   }
   return errata;
@@ -388,15 +468,17 @@ YamlParser::parse_fields_and_rules(
     auto const node_size = node.size();
     if (node_size != 2 && node_size != 3) {
       errata.error(
-          "Field or rule node at {} is not a sequence of length 2 "
+          "Field or rule at {} is not a sequence of length 2 "
           "or 3 as required.",
           node.Mark());
       continue;
     }
 
+    // Get name of header being tested
     TextView name{Localizer::localize_lower(node[YAML_RULE_KEY_INDEX].Scalar())};
     const YAML::Node ValueNode{node[YAML_RULE_VALUE_INDEX]};
     if (ValueNode.IsScalar()) {
+      // Legacy support for non-map nodes, not/nocase unsupported
       // There's only a single value associated with this field name.
       TextView value{Localizer::localize(node[YAML_RULE_VALUE_INDEX].Scalar())};
       fields.add_field(name, value);
@@ -418,6 +500,7 @@ YamlParser::parse_fields_and_rules(
         }
       }
     } else if (ValueNode.IsSequence()) {
+      // Legacy support for non-map nodes, not/nocase unsupported
       // There's a list of values associated with this field. This
       // indicates duplicate fields for the same field name.
       std::vector<TextView> values;
@@ -446,13 +529,48 @@ YamlParser::parse_fields_and_rules(
         }
       }
     } else if (ValueNode.IsMap()) {
+      // Extensible format for future features added
       // Verification is specified as a map, such as:
       // -[ Host, { value: example.com, as: equal } ]
+
+      // Get case setting (default false)
+      auto const rule_case_node{ValueNode[YAML_RULE_CASE_MAP_KEY]};
+      bool is_nocase = false;
+      if (rule_case_node && rule_case_node.IsScalar()) {
+        TextView case_str = Localizer::localize(rule_case_node.Scalar());
+        if (case_str == VERIFICATION_DIRECTIVE_IGNORE) {
+          is_nocase = true;
+        }
+      }
+
+      // Get rule type for "as: equal" structure, or "not: equal" if "as" fails
+      TextView rule_type;
+      bool is_inverted = false;
+      if (auto const rule_type_node_as = ValueNode[YAML_RULE_TYPE_MAP_KEY]; rule_type_node_as) {
+        rule_type = rule_type_node_as.Scalar();
+      } else if (auto const rule_type_node_not = ValueNode[YAML_RULE_TYPE_MAP_KEY_NOT];
+                 rule_type_node_not)
+      {
+        rule_type = rule_type_node_not.Scalar();
+        is_inverted = true;
+      } else if (assume_equality_rule) {
+        rule_type = VERIFICATION_DIRECTIVE_EQUALS;
+      } else {
+        errata.info(
+            "Field rule at {} ignored: no directive, and equality is not assumed",
+            node.Mark());
+        // Cannot use continue statement because of client request/server response
+      }
+
+      std::shared_ptr<RuleCheck> tester;
       TextView value;
-      if (auto const field_value_node{ValueNode[YAML_RULE_VALUE_MAP_KEY]}; field_value_node) {
+      auto const field_value_node{ValueNode[YAML_RULE_VALUE_MAP_KEY]};
+      if (field_value_node) {
         if (field_value_node.IsScalar()) {
+          // Single value
           value = Localizer::localize(field_value_node.Scalar());
           fields.add_field(name, value);
+          tester = RuleCheck::make_rule_check(name, value, rule_type, is_inverted, is_nocase);
         } else if (field_value_node.IsSequence()) {
           // Verification is for duplicate fields:
           // -[ set-cookie, { value: [ cookiea, cookieb], as: equal } ]
@@ -463,47 +581,26 @@ YamlParser::parse_fields_and_rules(
             values.emplace_back(localized_value);
             fields.add_field(name, localized_value);
           }
-          if (auto const rule_type_node{ValueNode[YAML_RULE_TYPE_MAP_KEY]}; rule_type_node) {
-            TextView rule_type{rule_type_node.Scalar()};
-            std::shared_ptr<RuleCheck> tester =
-                RuleCheck::make_rule_check(name, std::move(values), rule_type);
-            if (!tester) {
-              errata.error(
-                  "Field rule at {} does not have a valid directive ({})",
-                  node.Mark(),
-                  rule_type);
-              continue;
-            } else {
-              fields._rules.emplace(name, tester);
-            }
-          } else {
-            // No verification directive was specified.
-            if (assume_equality_rule) {
-              fields._rules.emplace(name, RuleCheck::make_equality(name, std::move(values)));
-            }
-          }
-          continue;
-        }
-      }
-      if (auto const rule_type_node{ValueNode[YAML_RULE_TYPE_MAP_KEY]}; rule_type_node) {
-        TextView rule_type{rule_type_node.Scalar()};
-        std::shared_ptr<RuleCheck> tester = RuleCheck::make_rule_check(name, value, rule_type);
-        if (!tester) {
-          errata.error(
-              "Field rule at {} does not have a valid directive ({})",
-              node.Mark(),
-              rule_type);
-          continue;
-        } else {
-          fields._rules.emplace(name, tester);
+          tester = RuleCheck::make_rule_check(
+              name,
+              std::move(values),
+              rule_type,
+              is_inverted,
+              is_nocase);
         }
       } else {
-        // No verification directive was specified.
-        if (assume_equality_rule) {
-          fields._rules.emplace(name, RuleCheck::make_equality(name, value));
-        }
-        continue;
+        // Attempt to create check with empty value; if failure, next if will catch
+        tester = RuleCheck::make_rule_check(name, value, rule_type, is_inverted, is_nocase);
       }
+
+      if (tester) {
+        fields._rules.emplace(name, tester);
+      } else if (!rule_type.empty()) {
+        // Do not report error if no rule because of client request/server response
+        errata.error("Field rule at {} has an invalid directive ({})", node.Mark(), rule_type);
+      }
+    } else {
+      errata.error("Field or rule at {} is null or malformed.", node.Mark());
     }
   }
   return errata;
@@ -554,7 +651,7 @@ YamlParser::process_pseudo_headers(YAML::Node const &node, HttpHeader &message)
     }
     message._method = pseudo_it->second;
     ++number_of_pseudo_headers;
-    message._is_request = true;
+    message.set_is_request();
   }
   pseudo_it = message._fields_rules->_fields.find(YAML_HTTP2_PSEUDO_SCHEME_KEY);
   if (pseudo_it != message._fields_rules->_fields.end()) {
@@ -567,7 +664,7 @@ YamlParser::process_pseudo_headers(YAML::Node const &node, HttpHeader &message)
     }
     message._scheme = pseudo_it->second;
     ++number_of_pseudo_headers;
-    message._is_request = true;
+    message.set_is_request();
   }
   pseudo_it = message._fields_rules->_fields.find(YAML_HTTP2_PSEUDO_AUTHORITY_KEY);
   if (pseudo_it != message._fields_rules->_fields.end()) {
@@ -589,7 +686,7 @@ YamlParser::process_pseudo_headers(YAML::Node const &node, HttpHeader &message)
     }
     message._authority = pseudo_it->second;
     ++number_of_pseudo_headers;
-    message._is_request = true;
+    message.set_is_request();
   }
   pseudo_it = message._fields_rules->_fields.find(YAML_HTTP2_PSEUDO_PATH_KEY);
   if (pseudo_it != message._fields_rules->_fields.end()) {
@@ -602,7 +699,7 @@ YamlParser::process_pseudo_headers(YAML::Node const &node, HttpHeader &message)
     }
     message._path = pseudo_it->second;
     ++number_of_pseudo_headers;
-    message._is_request = true;
+    message.set_is_request();
   }
   pseudo_it = message._fields_rules->_fields.find(YAML_HTTP2_PSEUDO_STATUS_KEY);
   if (pseudo_it != message._fields_rules->_fields.end()) {
@@ -627,14 +724,14 @@ YamlParser::process_pseudo_headers(YAML::Node const &node, HttpHeader &message)
           node.Mark());
     }
     ++number_of_pseudo_headers;
-    message._is_response = true;
+    message.set_is_response();
   }
   if (number_of_pseudo_headers > 0) {
     // Do some sanity checking on the user's pseudo headers, if provided.
-    if (message._is_response && number_of_pseudo_headers != 1) {
+    if (message.is_response() && number_of_pseudo_headers != 1) {
       errata.error("Found a mixture of request and response pseudo header fields: {}", node.Mark());
     }
-    if (message._is_request && number_of_pseudo_headers != 4) {
+    if (message.is_request() && number_of_pseudo_headers != 4) {
       errata.error(
           "Did not find all four required pseudo header fields "
           "(:method, :scheme, :authority, :path): {}",
@@ -664,6 +761,13 @@ ReplayFileHandler::parse_for_protocol_node(
   for (auto const &protocol_element : protocol_node) {
     if (!protocol_element.IsMap()) {
       desired_node.error("Protocol element at {} is not a map.", protocol_element.Mark());
+      return desired_node;
+    }
+    if (!protocol_element[YAML_SSN_PROTOCOL_NAME]) {
+      desired_node.error(
+          R"(Protocol element at {} does not have a "{}" element.)",
+          protocol_element.Mark(),
+          YAML_SSN_PROTOCOL_NAME);
       return desired_node;
     }
     if (protocol_element[YAML_SSN_PROTOCOL_NAME].Scalar() != protocol_name) {

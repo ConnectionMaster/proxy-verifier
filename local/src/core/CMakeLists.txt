@@ -8,7 +8,14 @@ find_package(OpenSSL REQUIRED)
 
 add_library(verifier-core STATIC
     ArgParser.cc
+    http.cc
+    http2.cc
+    http3.cc
+    https.cc
+    Localizer.cc
     ProxyVerifier.cc
+    verification.cc
+    YamlParser.cc
 )
 
 target_include_directories(verifier-core PUBLIC)

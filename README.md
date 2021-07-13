@@ -20,14 +20,20 @@ Table of Contents
          * [HTTP Specification](#http-specification)
             * [Server Response Lookup](#server-response-lookup)
          * [Protocol Specification](#protocol-specification)
+         * [Session and Transaction Delay Specification](#session-and-transaction-delay-specification)
       * [Traffic Verification Specification](#traffic-verification-specification)
          * [Field Verification](#field-verification)
          * [URL Verification](#url-verification)
          * [Status Verification](#status-verification)
          * [Example Replay File](#example-replay-file)
-      * [Install](#install)
-         * [Prerequisites](#prerequisites)
-         * [Building](#building)
+      * [Installing](#installing)
+         * [Prebuilt Binaries](#prebuilt-binaries)
+         * [Building from Source](#building-from-source)
+            * [Prerequisites](#prerequisites)
+            * [Build](#build)
+            * [Using Prebuilt Libraries](#using-prebuilt-libraries)
+            * [ASan Instrumentation](#asan-instrumentation)
+            * [Debug Build](#debug-build)
          * [Running the Tests](#running-the-tests)
             * [Unit Tests](#unit-tests)
             * [Gold Tests](#gold-tests)
@@ -37,10 +43,14 @@ Table of Contents
             * [--format &lt;format-specification&gt;](#--format-format-specification)
             * [--keys &lt;key1 key2 ... keyn&gt;](#--keys-key1-key2--keyn)
             * [--verbose](#--verbose)
+            * [--interface &lt;interface&gt;](#--interface-interface)
             * [--no-proxy](#--no-proxy)
             * [--strict](#--strict)
             * [--rate &lt;requests/second&gt;](#--rate-requestssecond)
             * [--repeat &lt;number&gt;](#--repeat-number)
+            * [--thread-limit &lt;number&gt;](#--thread-limit-number)
+            * [--qlog-dir &lt;directory&gt;](#--qlog-dir-directory)
+            * [--tls-secrets-log-file &lt;secrets_log_file_name&gt;](#--tls-secrets-log-file-secrets_log_file_name)
       * [Contribute](#contribute)
       * [License](#license)
 
@@ -112,10 +122,12 @@ which is a sequence where each item in the sequence describes the
 characteristics of each connection. For each session the protocol stack can be
 specified via the `protocol` node. This node describes the protocol
 characteristics of the connection such as what version of HTTP to use, whether
-to use TLS and what the characteristics of the TLS handshake should be.  In
-the absence of a `protocol` node the default protocol is HTTP/1 over TCP.
-See [Protocol Specification](#protocol-specification) below for details about the
-`protocol` node.  Each session is run in parallel by the verifier-client. 
+to use TLS and what the characteristics of the TLS handshake should be.  In the
+absence of a `protocol` node the default protocol is HTTP/1 over TCP.  See
+[Protocol Specification](#protocol-specification) below for details about the
+`protocol` node.  Each session is run in parallel by the verifier-client
+(although see [--thread-limit &lt;number&gt;](#--thread-limit-number) below for
+a way to serialize them).
 
 In addition to protocol specification, each session in the `sessions`
 sequence contains a `transactions` node. This itself is a sequence of
@@ -141,10 +153,11 @@ the following key/value YAML nodes:
 1. `headers`: This takes a `fields` node which has, as a value, a sequence of
    HTTP fields. Each field is itself a sequence of two values: the name of the
    field and the value for the field.
-1. `content`: This specifies the number of bytes to send. It takes a map as a
-   value. This map will contain an item with `size` as its name which maps to
-   an integer describing how many bytes the body should be. An auto-generated
-   body of this many bytes will be sent to the client.
+1. `content`: This specifies the body to send. It takes a map as a value. The
+   user can specify a `size` integer value in which an automated body of that
+   size will be generated. Otherwise a `data` string value can be provided in
+   which the specified body will be sent and an `encoding` taking `plain` or
+   `uri` to specify that the string is raw or URI encoded.
 
 Here's an example of a `client-request` node describing an HTTP/1.1 POST
 request with a request target of `/pictures/flower.jpeg`
@@ -251,6 +264,29 @@ therefore, would look like the following:
       - [ Content-Type, image/jpeg ]
     content:
       size: 3432
+```
+
+Finally, here is an example of a response with specific body content sent (YAML
+in this case) as opposed to the generated content specified by the
+`content:size` nodes above:
+
+```YAML
+  server-response:
+    status: 200
+    reason: OK
+    headers:
+      fields:
+      - [ Date, "Sat, 16 Mar 2019 03:11:36 GMT" ]
+      - [ Content-Type, text/yaml ]
+      - [ Transfer-Encoding, chunked ]
+      - [ Connection, keep-alive ]
+    content:
+      encoding: plain
+      data: |
+          ### Heading
+
+          * Bullet
+          * Points
 ```
 
 #### Server Response Lookup
@@ -384,6 +420,83 @@ The following protocol specification features are not currently implemented:
 
 If there is no `protocol` node specified, then Proxy Verifier will default to
 establishing an HTTP/1 connection over TCP (no TLS).
+
+### Session and Transaction Delay Specification
+
+A user can also stipulate per session and/or per transaction delays to be
+inserted by the Verifier client and server during the replay of traffic. This
+is done via the `delay` node which takes a unit-specified duration for the
+associated delay.  During traffic replay, the delay is inserted before the
+associated session is established or before the client request or server
+response is sent.  Proxy Verifier recognizes the following time duration units
+for the `delay` node:
+
+Unit Suffix | Meaning
+----------- | -------
+s           | seconds
+ms          | milliseconds
+us          | microseconds
+
+Here is a sample replay file snippet that demonstrates the specification of a
+set of delays:
+
+```YAML
+sessions:
+- delay: 2s
+
+  transactions:
+
+    client-request:
+      delay: 15ms
+
+      method: POST
+      url: /a/path.jpeg
+      version: '1.1'
+      headers:
+        fields:
+        - [ Content-Length, '399' ]
+        - [ Content-Type, image/jpeg ]
+        - [ Host, example.com ]
+        - [ uuid, 1 ]
+
+  server-response:
+    delay: 17000 us
+
+    status: 200
+    reason: OK
+    headers:
+      fields:
+      - [ Date, "Sat, 16 Mar 2019 03:11:36 GMT" ]
+      - [ Content-Type, image/jpeg ]
+      - [ Transfer-Encoding, chunked ]
+      - [ Connection, keep-alive ]
+    content:
+      size: 3432
+```
+
+Note that this example specifies the following delays:
+
+* The client delays 2 seconds before establishing the session.
+* The client also delays 15 milliseconds before sending the client
+  request.
+* The server delays 17 milliseconds (17,000 microseconds) before sending the
+  corresponding response after receiving the request.
+
+Be aware of the following characteristics of the `delay` node:
+
+* The Verifier client interprets and implements `delay` for sessions in the
+  `sessions` node and for transactions in the `client-request` node. The
+  Verifier server interprets delay only for transactions in the
+  `server-response` node and ignores `sessions` delays. Since the server is
+  passive in receiving connections, it's not obvious what a server-side session
+  delay would mean in this context.
+* Notice that Proxy Verifier supports microsecond level delay granularity, and
+does indeed faithfully insert delays at the appropriate times during replay
+with that precision of time. Be aware, however, that for the vast majority of
+networks anything more precise than a millisecond will not generally be useful.
+
+See also [--rate &lt;requests/second&gt;](#--rate-requestssecond) below for
+rate specification of transactions.
 
 ## Traffic Verification Specification
 
@@ -548,6 +661,24 @@ The following demonstrates the `suffix` directive which specifies that `X-Forwar
   - [ X-Forwarded-For, { value: 2, as: suffix } ]
 ```
 
+Proxy Verifier supports inverting the result of any rule by using `not` instead of `as`. The following demonstrates the `prefix` directive which specifies that `X-Forwarded-For` should have been received from the proxy with a field value not starting with "a":
+
+```YAML
+  - [ X-Forwarded-For, { value: a, not: prefix } ]
+```
+
+Proxy Verifier also supports ignoring the upper/lower case distinction with another directive: `case: ignore`. The following demonstrates the `suffix` directive which specifies that `X-Forwarded-For` should have been received from the proxy with a field value starting with "a" or "A":
+
+```YAML
+  - [ X-Forwarded-For, { value: a, as: prefix, case: ignore } ]
+```
+
+The `not` and `case: ignore` directives can both be applied on the same rule. The following demonstrates the `suffix` directive which specifies that `X-Forwarded-For` should have been received from the proxy with a field value not starting with "a" nor "A":
+
+```YAML
+  - [ X-Forwarded-For, { value: a, not: prefix, case: ignore } ]
+```
+
 ### URL Verification
 
 In a manner similar to field verification described above, a mechanism exists
@@ -697,12 +828,14 @@ sessions:
 
     #
     # Direct the Proxy Verifier server to verify that the request received from
-    # the proxy has a path in the request target that contains "flower.jpeg"
+    # the proxy has a path in the request target that contains "flower.jpeg",
+    # has a path that is not prefixed with "JPEG" (case insensitively),
     # and has the Content-Length field of any value.
     #
     proxy-request:
       url:
       - [ path, { value: flower.jpeg, as: contains } ]
+      - [ path, { value: JPEG, not: prefix, case: ignore } ]
 
       headers:
         fields:
@@ -806,73 +939,207 @@ sessions:
       status: 200
 ```
 
-## Install
+## Installing
+
+### Prebuilt Binaries
+
+Starting with the v2.2.0 release, statically linked binaries for Linux and Mac
+are provided with the release in the
+[Releases](https://github.com/yahoo/proxy-verifier/releases) page. If you do not
+need your own customized build of Proxy Verifier, the easiest way to start
+using it is to simply download the proxy-verifier `tar.gz` for the desired
+release, untar it on the desired box, and copy the `verifier-client` and
+`verifier-server` binaries to a convenient location from which to run them.
+The Linux binaries should run on Ubuntu, Alma/CentOS/Fedora/RHEL, FreeBSD, and
+other Linux flavors.
+
+### Building from Source
 
 These instructions describe how to build a copy of the Proxy Verifier project
 on your local machine for development and testing purposes.
 
+#### Prerequisites
 
-### Prerequisites
+Proxy Verifier is built using [SCons](https://scons.org). Scons is a Python
+module, so installing it is as straightforward as installing any Python
+package. A top-level
+[Pipfile](https://github.com/yahoo/proxy-verifier/tree/master/Pipfile) is
+provided to install Scons and its use is described and assumed in these
+instructions, but it can also be installed using pip if preferred.
 
-Building and running Proxy Verifier requires the following to be installed on the system:
+Scons will clone and build the dependent libraries using Automake. Thus
+building will require the installation of the following system packages:
 
-* SCons. Proxy Verifier is built using the [SCons](https://scons.org) Python
-  build tool.
-* OpenSSL. The version of OpenSSL compiled against will dictate the TLS version
-  the built Proxy Verifier will support. Use at least version 1.1.1 for TLS 1.3
-  support.
-* [Nghttp2](https://nghttp2.org) This is the framework used for parsing HTTP/2
-  traffic. Main development of Proxy Verifier has been done with version 1.39,
-  but earlier versions may work as well.
+* git
+* pipenv
+* autoconf
+* libtool
+* pkg-config
 
-### Building
+For system-specific commands to install these packages (Ubuntu, CentOS, etc.),
+one can view the
+[Dockerfile](https://docs.docker.com/engine/reference/builder/) documents
+provided under
+[docker](https://github.com/yahoo/proxy-verifier/tree/master/docker). These
+demonstrate, for each system, what commands are used to install these package
+dependencies. Naturally, performing a `docker build` against these Dockerfiles
+can also be used to create Docker images, containers from which builds can be
+performed.
 
-OpenSSL and Nghttp2 are linked against dynamically and have their own SCons
-arguments to point to their locations. SCons is a Python module. For
-convenience, a Pipfile exists at the root of the Proxy Verifier repo that
-specifies the SCons Python modules needed to build Proxy Verifier. Assuming you
-have [pipenv](https://pypi.org/project/pipenv/) installed in your environment,
-you can simply use `pipenv install` to configure your Python virtual
-environment for SCons, enter that environment with `pipenv shell`, and
-then build using the `scons` command.
+In addition to the above system package dependencies, Proxy Verifier utilizes
+the following C++ libraries:
+
+* [OpenSSL](https://www.openssl.org) is used to implement TLS encryption.
+  Proxy Verifier requires the version of OpenSSL that supports QUIC.
+* [Nghttp2](https://nghttp2.org) is used for parsing HTTP/2 traffic.
+* [ngtcp2](https://github.com/ngtcp2/ngtcp2) is used for parsing QUIC
+  traffic.
+* [nghttp3](https://github.com/ngtcp2/nghttp3) is used for parsing HTTP/3
+  traffic.
+* [yaml-cpp](https://github.com/jbeder/yaml-cpp) is used for parsing the YAML
+  replay files.
+* [libswoc](https://github.com/SolidWallOfCode/libswoc) are a set of C++
+  library extensions to support string parsing, memory management, logging, and
+  other features.
+
+*Note*: None of these libraries need to be explicitly installed before you
+build.  By default, Scons will fetch and build each of these libraries as a
+part of building the project.
+
+#### Build
+
+Once the above-listed system packages (git, autoconf, etc.) are installed on
+your system, you can build Proxy Verifier using Scons. This involves first
+creating the Python virtual environment and then running the `scons` command
+to build Proxy Verifier. Here is an example invocation:
+
+```
+# Install scons and any of its Python requirements. This only needs to be
+# done once before the first invocation of scons.
+#
+# Note: for older RHEL/CentOS systems, you will have to souce the appropriate
+# Python 3 enable script to initialize the correct Python 3 environment. For
+# example:
+# source /opt/rh/rh-python38/enable
+pipenv install
+
+# Now run scons to build proxy-verifier.
+pipenv run scons -j4
+```
+
+This will build and install `verifier-client` and `verifier-server` in the
+`bin/` directory at the root of the repository. `-j4` directs Scons to build
+with 4 threads. Adjust according to the capabilities of your build system.
+
+#### Using Prebuilt Libraries
+
+As mentioned above, Scons will by default fetch the various library
+dependencies (OpenSSL, Nghttp2, etc.), build, and manage those for you. If you
+do not change the fetched source code for these libraries, they will not be
+rebuilt after the first `scons` build invocation. This behavior is convenient
+as it relieves the burden of fetching and building these libraries from the
+developer. However, Scons will rescan the fetched source trees for these
+libraries on every call of `scons` to inspect them for any changes. For
+long-term development projects, a developer may find it more efficient to build
+these libraries externally and relieve Scons from managing them. To
+conveniently support this, the
+[build_library_dependencies.sh](https://github.com/yahoo/proxy-verifier/blob/master/tools/build_library_dependencies.sh)
+script is provided to build these libraries. To build and install the
+libraries, run that script, passing as an argument the desired install location
+for the various libraries. Then point Scons to those libraries using various
+`--with` directives.
+
+Here's an example invocation of `scons` along with the use of the library build
+script:
+
+```
+# Alter this to your desired library location.
+http3_libs_dir=${HOME}/src/http3_libs
+
+bash ./tools/build_http3_dependencies.sh ${http3_libs_dir}
+
+pipenv install
+pipenv run scons \
+    -j4 \
+    --with-ssl=${http3_libs_dir}/openssl \
+    --with-nghttp2=${http3_libs_dir}/nghttp2 \
+    --with-ngtcp2=${http3_libs_dir}/ngtcp2 \
+    --with-nghttp3=${http3_libs_dir}/nghttp3
+```
+
+The [Dockerfile](https://github.com/yahoo/proxy-verifier/tree/master/docker)
+documents run this build script, installing the HTTP packages in `/opt`.
+Therefore, if you are developing in a container made from images generated from
+these Dockerfile documents, you can use the following `scons` command to build
+Proxy Verifier:
 
 ```
 pipenv install
-pipenv shell
-scons \
-    -j8 \
-    --with-ssl=/path/to/openssl \
-    --with-nghttp2=/path/to/nghttp2 \
-    --cfg=release \
-    proxy-verifier
+pipenv run scons \
+    -j4 \
+    --with-ssl=/opt/openssl \
+    --with-nghttp2=/opt/nghttp2 \
+    --with-ngtcp2=/opt/ngtcp2 \
+    --with-nghttp3=/opt/nghttp3
 ```
 
-This will build `verifier-client` `verifier-server` in the `bin/` directory at
-the root of the repository. Note:
+As a further convenience, if these libraries (`openssl`, `nghttp2`, `ngtcp2`,
+and `nghttp3`, with those exact names) exist under a single directory, such as
+is the case with images built from the provided
+[Dockerfile](https://github.com/yahoo/proxy-verifier/tree/master/docker)
+documemnts, then you can specify the location of these libraries with a single
+`--with-libs` argument. Thus the previous command can be expressed like so:
 
-1. `-j8` directs scons to build with 8 threads. Adjust according to the
-   capabilities of your build system.
-1. `--with-ssl` and `--with-nghttp2` both take the path to the system's opennsl
-   and nghttp2 devel install locations, respectively. Proxy Verifier will be
-   dynamically linked with these libraries.
-1. By default scons does a debug build without optimization. `--cfg=release`
-   directs it to do a non-debug build for the various components with
-   optimization enabled (e.g., with `-O2` for g++ builds). This is critical if
-   replaying high volumes of traffic.
+```
+pipenv install
+pipenv run scons -j4 --with-libs=/opt
+```
+
+#### ASan Instrumentation
+
+The local Sconstruct file is configured to take an optional `--enable-asan`
+parameter. If this is passed to the `scons` build line then the Proxy Verifier
+objects and binaries will be compiled and linked with the flags that instrument
+them for [AddressSanatizer](https://clang.llvm.org/docs/AddressSanitizer.html).
+This assumes that the system has the AddressSanatizer library installed on the
+system. Thus the above invocation would look like the following to compile it
+with AddressSanitizer instrumentation:
+
+```
+pipenv install
+pipenv run scons \
+    -j4 \
+    --with-ssl=/path/to/openssl \
+    --with-nghttp2=/path/to/nghttp2 \
+    --with-ngtcp2=/path/to/ngtcp2 \
+    --with-nghttp3=/path/to/nghttp3 \
+    --enable-asan
+```
+
+#### Debug Build
+
+By default, Scons will build the Proxy Verifier project in `release` mode. This
+means that the binaries will compiled with optimization. If an unoptimized
+debug build is desired, then pass the `--cfg=debug` option to `scons`:
+
+```
+pipenv run scons -j4 --cfg=debug
+```
 
 ### Running the Tests
 
 #### Unit Tests
 
 To build and run the unit tests, use the `run_utest` Scons target (this assumes
-you are in the pipenv shell you used to build Proxy Verifier, see above):
+you previously ran `pipenv install`, see above):
 
 ```
-scons \
-    -j8 \
+pipenv run scons \
+    -j4 \
     --with-ssl=/path/to/openssl \
     --with-nghttp2=/path/to/nghttp2 \
-    --cfg=release \
+    --with-ngtcp2=/path/to/ngtcp2 \
+    --with-nghttp3=/path/to/nghttp3 \
     run_utest::
 ```
 
@@ -900,6 +1167,28 @@ quick description of the various command-line options. See the [AuTest
 Documentation](https://autestsuite.bitbucket.io) for further details about the
 framework.
 
+**A note for macOS**: The Python virtual environment for these gold tests
+requires the [cryptograpy](https://github.com/pyca/cryptography) package as a
+dependency of the [pyOpenSSL](https://www.pyopenssl.org/en/stable/) package.
+Pipenv will install this automatically, but the installation of the
+`cryptography` package will require compiling certain c files against OpenSSL.
+macOS has its own SSL libraries which brew's version of OpenSSL does not
+replace, for understandable reasons. The building of `cryptography` will
+fail against the system's SSL libraries. To point the build to brew's OpenSSL
+libraries, the `autest.sh` script exports the following variables before
+running `pipenv install`:
+
+```
+export LDFLAGS="-L/usr/local/opt/openssl/lib"
+export CPPFLAGS="-I/usr/local/opt/openssl/include"
+export PKG_CONFIG_PATH="/usr/local/opt/openssl/lib/pkgconfig"
+```
+
+Thus if you stick with using the `autest.sh` script you do not need to worry
+about this. But if you install pipenv by hand rather than through the
+`autest.sh` script on macOS, then keep this in mind and export those variables
+before running `pipenv install`.
+
 ## Usage
 
 This section describes how to run the Proxy Verifier client and server at
@@ -925,11 +1214,11 @@ connections:
 ```
 verifier-server \
     run \
-    --listen 127.0.0.1:8080 \
+    --listen-http 127.0.0.1:8080 \
     --listen-https 127.0.0.1:4443 \
     --server-cert <server_cert> \
     --ca-certs <file_or_directory_of_ca_certs> \
-    <replay_file_directory>
+    <replay_file_or_directory>
 ```
 
 Here's an example invocation of the verifier-client, configuring it to connect to
@@ -941,14 +1230,24 @@ verifier-client \
     run \
     --client-cert <client_cert> \
     --ca-certs <file_or_directory_of_ca_certs> \
-    <replay_file_directory> \
-    127.0.0.1:8081 \
-    127.0.0.1:4444
+    --connect-http 127.0.0.1:8081 \
+    --connect-https 127.0.0.1:4444 \
+    <replay_file_or_directory>
 ```
 
 With these two invocations, the verifier-client and verifier-server will replay the
-sessions and transactions in `<replay_file_directory>`  and perform any field
+sessions and transactions in `<replay_file_or_directory>`  and perform any field
 verification described therein.
+
+On the server either `--listen-http` or `--listen-https` or both must be
+provided. That is, for example, if you are only testing HTTPS traffic, you may
+only specify `--listen-https`. The same is true on the client: either
+`--connect-http` or `--connect-https` or both must be provided. These address
+arguments take a comma-separated list of address/port pairs to specify multiple
+listening or connecting sockets. The processing of these arguments
+automatically detects any IPv6 addresses if provided. The client's processing
+of `--connect-http` and `--connect-https` arguments will resolve fully
+qualified domain names.
 
 Note that the `--client-cert` and `--server-cert` both take either a
 certificate file containing the public and private key or a directory
@@ -956,7 +1255,8 @@ containing pem and key files. Similarly, the `--ca-certs` takes either a file
 containing one or more certificates or a directory with separate certificate
 files.  For convenience, the
 [test/keys](https://github.com/bneradt/proxy-verifier/tree/expand_readme/test/keys)
-directory contains key files which can be used for testing.
+directory contains key files which can be used for testing. These certificate
+arguments are only required if HTTPS traffic will be replayed.
 
 ### Optional Arguments
 
@@ -1043,6 +1343,12 @@ verifier-client \
     --verbose diag
 ```
 
+#### --interface \<interface\>
+
+Initiate connections from the specified interface, such as eth0:1.
+
+This is a client-side only option.
+
 #### --no-proxy
 
 As explained above, replay files contain traffic information for both client to
@@ -1077,11 +1383,25 @@ any verification issues against every field specified in the replay file.
 
 #### --rate \<requests/second\>
 
-By default, the client will replay the transactions in the replay file as fast
-as possible. If the user desires to configure the client to replay the
-transactions at a particular rate, they can provide the `--rate` argument. The
-argument takes the number of requests per second the client will attempt to
-send requests at.
+By default, the client will replay the session and transactions in the replay
+files as fast as possible. If the user desires to configure the client to
+replay the transactions at a particular rate, they can provide the `--rate`
+argument. This argument takes the number of requests per second the client will
+attempt to send requests at.
+
+Note session and transaction timing data can be specified in the replay files.
+These are provided via `start-time` nodes for each `session` and `transaction`.
+`start-time` takes as a value the number of nanoseconds since Unix epoch (or
+whatever other time of reference observed by all `start-time` nodes in the set
+of replay files being run) associated for that session or transaction. With
+this timing information, if `--rate` is provided, Proxy Verifier simply scales
+the relative time deltas between sessions and transactions that appropriately
+achieves the desired transaction rate. [Traffic
+Dump](https://docs.trafficserver.apache.org/en/latest/admin-guide/plugins/traffic_dump.en.html)
+records such timing information when it writes replay files.  In the absence of
+`start-time` nodes, Proxy Verifier will attempt to apply an appropriate uniform
+delay across the sessions and transactions to achieve the specified `--rate`
+value.
 
 This is a client-side only option.
 
@@ -1089,10 +1409,35 @@ This is a client-side only option.
 
 By default, the client will replay all the transactions once in the set of
 input replay files. If the user would like the client to automatically repeat
-this set a number of times, they can provide the `--repeat` argument. The
+this set a number of times, they can provide the `--repeat` option. The
 argument takes the number of times the client should replay the entire dataset.
 
 This is a client-side only option.
+
+#### --thread-limit \<number\>
+
+Each connection, corresponding to a `session` in a replay file, is dispatched
+on the client in parallel. Likewise, each accepted connection on the server is
+handled in parallel. Each of these sessions is handled via a single thread of
+execution. By default, Proxy Verifier limits the number of threads for handling
+these connections to 2,000. This limit can be changed via the `--thread-limit`
+option. Setting a value of 1 on the client will effectively cause sessions
+to be replayed in serial.
+
+#### --qlog-dir \<directory\>
+
+Proxy Verifier supports logging of replayed QUIC traffic information conformant
+to the qlog format. If the `--qlog-dir` option is provided, then qlog files for all
+replayed QUIC traffic will be written into the specified directory.  qlog
+diagnostic logging is disabled by default.
+
+#### --tls-secrets-log-file \<secrets_log_file_name\>
+
+To facilitate debugging, Proxy Verifier supports logging TLS keys for encrypted
+replayed traffic. If this option is used, TLS key logging will be appended to
+the specified filename. This file can then be provided to protocol analyzers
+such as Wireshark to decrypt the traffic. TLS key logging is disabled by
+default.
 
 ## Contribute
 

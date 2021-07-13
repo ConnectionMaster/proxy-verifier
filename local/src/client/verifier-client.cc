@@ -6,12 +6,12 @@
  */
 
 #include "core/ArgParser.h"
+#include "core/http.h"
+#include "core/http2.h"
+#include "core/http3.h"
+#include "core/https.h"
 #include "core/ProxyVerifier.h"
 #include "core/YamlParser.h"
-#include "swoc/bwf_ex.h"
-#include "swoc/bwf_ip.h"
-#include "swoc/bwf_std.h"
-#include "swoc/swoc_file.h"
 
 #include <assert.h>
 #include <chrono>
@@ -26,6 +26,11 @@
 #include <dirent.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+
+#include "swoc/bwf_ex.h"
+#include "swoc/bwf_ip.h"
+#include "swoc/bwf_std.h"
+#include "swoc/swoc_file.h"
 
 namespace swoc
 {
@@ -53,11 +58,67 @@ bool Use_Strict_Checking = false;
 
 std::unordered_set<std::string> Keys_Whitelist;
 
+swoc::TextView specified_interface;
+
 std::mutex LoadMutex;
 
 std::list<std::shared_ptr<Ssn>> Session_List;
 
-std::deque<swoc::IPEndpoint> Target, Target_Https;
+struct TargetSelector
+{
+  /** Round robin retrieval of HTTP addresses. */
+  swoc::IPEndpoint const *
+  get_http_target()
+  {
+    if (http_targets.empty()) {
+      return nullptr;
+    }
+    auto const *http_target = &http_targets[http_target_index];
+    if (++http_target_index >= http_targets.size()) {
+      http_target_index = 0;
+    }
+    return http_target;
+  }
+
+  /** Round robin retrieval of HTTPS addresses. */
+  swoc::IPEndpoint const *
+  get_https_target()
+  {
+    if (https_targets.empty()) {
+      return nullptr;
+    }
+    auto const *https_target = &https_targets[https_target_index];
+    if (++https_target_index >= https_targets.size()) {
+      https_target_index = 0;
+    }
+    return https_target;
+  }
+
+  /** Round robin retrieval of HTTPS addresses. */
+  swoc::IPEndpoint const *
+  get_http3_target()
+  {
+    if (http3_targets.empty()) {
+      return nullptr;
+    }
+    auto const *http3_target = &http3_targets[http3_target_index];
+    if (++http3_target_index >= http3_targets.size()) {
+      http3_target_index = 0;
+    }
+    return http3_target;
+  }
+
+  std::deque<swoc::IPEndpoint> http_targets;
+  std::deque<swoc::IPEndpoint> https_targets;
+  std::deque<swoc::IPEndpoint> http3_targets;
+
+private:
+  size_t http_target_index = 0;
+  size_t https_target_index = 0;
+  size_t http3_target_index = 0;
+};
+
+TargetSelector Target_Selector;
 
 /** Whether the replay-client constructs traffic according to client-request or
  * proxy-request directives.
@@ -205,24 +266,41 @@ ClientReplayFileHandler::ssn_open(YAML::Node const &node)
       errata.note(std::move(http_node.errata()));
       return errata;
     }
-    if (http_node.result().IsDefined() &&
-        http_node.result()[YAML_SSN_PROTOCOL_VERSION].Scalar() == "2") {
-      _ssn->is_h2 = true;
+    if (http_node.result().IsDefined() && http_node.result()[YAML_SSN_PROTOCOL_VERSION]) {
+      if (http_node.result()[YAML_SSN_PROTOCOL_VERSION].Scalar() == "2") {
+        _ssn->is_h2 = true;
+      } else if (http_node.result()[YAML_SSN_PROTOCOL_VERSION].Scalar() == "3") {
+        _ssn->is_h3 = true;
+      }
     }
   }
 
   if (node[YAML_TIME_START_KEY]) {
-    auto const start_time = get_start_time(node);
-    if (!start_time.is_ok()) {
-      errata.note(std::move(start_time.errata()));
+    auto &&[start_time, start_time_errata] = get_start_time(node);
+    if (!start_time_errata.is_ok()) {
+      errata.note(std::move(start_time_errata));
       errata.error(
-          R"(Session at "{}":{} has a bad "{}" key.)",
+          R"(Session at "{}":{} has a bad "{}" key value.)",
           _path,
           _ssn->_line_no,
           YAML_TIME_START_KEY);
       return errata;
     }
     _ssn->_start = start_time;
+  }
+
+  if (node[YAML_TIME_DELAY_KEY]) {
+    auto &&[delay_time, delay_errata] = get_delay_time(node);
+    if (!delay_errata.is_ok()) {
+      errata.note(std::move(delay_errata));
+      errata.error(
+          R"(Session at "{}":{} has a bad "{}" key value.)",
+          _path,
+          _ssn->_line_no,
+          YAML_TIME_DELAY_KEY);
+      return errata;
+    }
+    _ssn->_user_specified_delay_duration = delay_time;
   }
   return errata;
 }
@@ -232,8 +310,8 @@ ClientReplayFileHandler::txn_open(YAML::Node const &node)
 {
   swoc::Errata errata;
   _txn_node = &node;
-  _txn._req._is_request = true;
-  _txn._rsp._is_response = true;
+  _txn._req.set_is_request();
+  _txn._rsp.set_is_response();
   if (!node[YAML_CLIENT_REQ_KEY]) {
     errata.error(
         R"(Transaction node at "{}":{} does not have a client request [{}].)",
@@ -245,17 +323,17 @@ ClientReplayFileHandler::txn_open(YAML::Node const &node)
     return errata;
   }
   if (node[YAML_TIME_START_KEY]) {
-    auto const transaction_start_time = get_start_time(node);
-    if (!transaction_start_time.is_ok()) {
-      errata.note(std::move(transaction_start_time.errata()));
+    auto &&[transaction_start_time, start_time_errata] = get_start_time(node);
+    if (!start_time_errata.is_ok()) {
+      errata.note(std::move(start_time_errata));
       errata.error(
-          R"(Transaction at "{}":{} has a bad "{}" key.)",
+          R"(Transaction at "{}":{} has a bad "{}" key value.)",
           _path,
           node.Mark().line,
           YAML_TIME_START_KEY);
       return errata;
     }
-    if (transaction_start_time.result() < _ssn->_start) {
+    if (transaction_start_time < _ssn->_start) {
       // Maybe the mechanisms used to measure session start and transaction
       // count are different and for some reason the session start time is
       // recorded as later than the transaction start. For our purposes, this
@@ -263,8 +341,9 @@ ClientReplayFileHandler::txn_open(YAML::Node const &node)
       // the earliest transaction.
       _ssn->_start = transaction_start_time;
     }
-    _txn._start = transaction_start_time.result() - _ssn->_start;
+    _txn._start = transaction_start_time - _ssn->_start;
   }
+
   LoadMutex.lock();
   return errata;
 }
@@ -274,10 +353,28 @@ ClientReplayFileHandler::client_request(YAML::Node const &node)
 {
   swoc::Errata errata;
   if (!Use_Proxy_Request_Directives) {
-    _txn._req._is_http2 = _ssn->is_h2;
+    if (_ssn->is_h2) {
+      _txn._req.set_is_http2();
+    } else if (_ssn->is_h3) {
+      _txn._req.set_is_http3();
+    }
     errata.note(YamlParser::populate_http_message(node, _txn._req));
     if (_txn._req._method.empty()) {
       errata.error(R"(client-request node without a method at "{}":{}.)", _path, node.Mark().line);
+    }
+
+    if (node[YAML_TIME_DELAY_KEY]) {
+      auto &&[delay_time, delay_errata] = get_delay_time(node);
+      if (!delay_errata.is_ok()) {
+        errata.note(std::move(delay_errata));
+        errata.error(
+            R"(client-request node at "{}":{} has a bad "{}" key value.)",
+            _path,
+            _ssn->_line_no,
+            YAML_TIME_DELAY_KEY);
+        return errata;
+      }
+      _txn._user_specified_delay_duration = delay_time;
     }
   }
   return errata;
@@ -288,10 +385,28 @@ ClientReplayFileHandler::proxy_request(YAML::Node const &node)
 {
   swoc::Errata errata;
   if (Use_Proxy_Request_Directives) {
-    _txn._req._is_http2 = _ssn->is_h2;
+    if (_ssn->is_h2) {
+      _txn._req.set_is_http2();
+    } else if (_ssn->is_h3) {
+      _txn._req.set_is_http3();
+    }
     errata.note(YamlParser::populate_http_message(node, _txn._req));
     if (_txn._req._method.empty()) {
       errata.error(R"(proxy-request node without a method at "{}":{}.)", _path, node.Mark().line);
+    }
+
+    if (node[YAML_TIME_DELAY_KEY]) {
+      auto &&[delay_time, delay_errata] = get_delay_time(node);
+      if (!delay_errata.is_ok()) {
+        errata.note(std::move(delay_errata));
+        errata.error(
+            R"(proxy-request node at "{}":{} has a bad "{}" key value.)",
+            _path,
+            _ssn->_line_no,
+            YAML_TIME_DELAY_KEY);
+        return errata;
+      }
+      _txn._user_specified_delay_duration = delay_time;
     }
   }
   return errata;
@@ -303,7 +418,11 @@ ClientReplayFileHandler::proxy_response(YAML::Node const &node)
   if (!Use_Proxy_Request_Directives) {
     // We only expect proxy responses when we are behaving according to the
     // client-request directives and there is a proxy.
-    _txn._rsp._is_http2 = _ssn->is_h2;
+    if (_ssn->is_h2) {
+      _txn._rsp.set_is_http2();
+    } else if (_ssn->is_h3) {
+      _txn._rsp.set_is_http3();
+    }
     _txn._rsp._fields_rules = std::make_shared<HttpFields>(*global_config.txn_rules);
     return YamlParser::populate_http_message(node, _txn._rsp);
   }
@@ -317,7 +436,11 @@ ClientReplayFileHandler::server_response(YAML::Node const &node)
   if (Use_Proxy_Request_Directives) {
     // If we are behaving like the proxy, then replay-client is talking directly
     // with the server and should expect the server's responses.
-    _txn._rsp._is_http2 = _ssn->is_h2;
+    if (_ssn->is_h2) {
+      _txn._rsp.set_is_http2();
+    } else if (_ssn->is_h3) {
+      _txn._rsp.set_is_http3();
+    }
     _txn._rsp._fields_rules = std::make_shared<HttpFields>(*global_config.txn_rules);
     errata.note(YamlParser::populate_http_message(node, _txn._rsp));
     if (_txn._rsp._status == 0) {
@@ -392,14 +515,6 @@ struct Engine
   ts::ArgParser parser;    ///< Command line argument parser.
   ts::Arguments arguments; ///< Results from argument parsing.
 
-  static constexpr swoc::TextView COMMAND_RUN{"run"};
-  static constexpr swoc::TextView COMMAND_RUN_ARGS{
-      "Arguments:\n"
-      "\t<dir>: Directory containing replay files.\n"
-      "\t<upstream http>: hostname and port for http requests. Can be a comma "
-      "seprated list\n"
-      "\t<upstream https>: hostname and port for https requests. Can be a "
-      "comma separated list "};
   void command_run();
 
   /// The process return code with which to exit.
@@ -409,7 +524,7 @@ struct Engine
 int Engine::process_exit_code = 0;
 
 void
-Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::IPEndpoint const &target_https)
+Run_Session(Ssn const &ssn, TargetSelector &target_selector)
 {
   swoc::Errata errata;
   std::unique_ptr<Session> session;
@@ -419,25 +534,54 @@ Run_Session(Ssn const &ssn, swoc::IPEndpoint const &target, swoc::IPEndpoint con
       R"(Starting session "{}":{} protocol={}.)",
       ssn._path,
       ssn._line_no,
-      ssn.is_h2 ? "h2" : (ssn.is_tls ? "https" : "http"));
+      ssn.is_h3 ? "h3" : (ssn.is_h2 ? "h2" : (ssn.is_tls ? "https" : "http")));
 
-  if (ssn.is_h2) {
-    session = std::make_unique<H2Session>(ssn._client_sni, ssn._client_verify_mode);
-    real_target = &target_https;
-    errata.diag("Connecting via HTTP/2 over TLS.");
+  if (ssn.is_h3) {
+    real_target = target_selector.get_http3_target();
+    if (real_target == nullptr) {
+      errata.error("Could not replay an HTTP/3 session because no HTTP/3 ports are provided.");
+    } else {
+      session = std::make_unique<H3Session>(ssn._client_sni, ssn._client_verify_mode);
+      errata.diag("Connecting via HTTP/3 over QUIC.");
+    }
+  } else if (ssn.is_h2) {
+    real_target = target_selector.get_https_target();
+    if (real_target == nullptr) {
+      errata.error("Could not replay an HTTP/2 session because no HTTPS ports are provided.");
+    } else {
+      session = std::make_unique<H2Session>(ssn._client_sni, ssn._client_verify_mode);
+      errata.diag("Connecting via HTTP/2 over TLS.");
+    }
   } else if (ssn.is_tls) {
-    session = std::make_unique<TLSSession>(ssn._client_sni, ssn._client_verify_mode);
-    real_target = &target_https;
-    errata.diag("Connecting via TLS.");
+    real_target = target_selector.get_https_target();
+    if (real_target == nullptr) {
+      errata.error("Could not replay an HTTPS session because no HTTPS ports are provided.");
+    } else {
+      session = std::make_unique<TLSSession>(ssn._client_sni, ssn._client_verify_mode);
+      errata.diag("Connecting via TLS.");
+    }
   } else {
-    session = std::make_unique<Session>();
-    real_target = &target;
-    errata.diag("Connecting via HTTP.");
+    real_target = target_selector.get_http_target();
+    if (real_target == nullptr) {
+      errata.error("Could not replay an HTTP session because no HTTP ports are provided.");
+    } else {
+      session = std::make_unique<Session>();
+      errata.diag("Connecting via HTTP.");
+    }
   }
 
-  errata.note(session->do_connect(real_target));
+  if (real_target == nullptr) {
+    Engine::process_exit_code = 1;
+    return;
+  }
+
+  errata.note(session->do_connect(specified_interface, real_target));
   if (errata.is_ok()) {
-    errata.note(session->run_transactions(ssn._transactions, real_target, ssn._rate_multiplier));
+    errata.note(session->run_transactions(
+        ssn._transactions,
+        specified_interface,
+        real_target,
+        ssn._rate_multiplier));
   }
   if (!errata.is_ok()) {
     Engine::process_exit_code = 1;
@@ -450,19 +594,13 @@ TF_Client(std::thread *t)
 {
   ClientThreadInfo thread_info;
   thread_info._thread = t;
-  size_t target_index = 0;
-  size_t target_https_index = 0;
 
   while (!Shutdown_Flag) {
     thread_info._ssn = nullptr;
     Client_Thread_Pool.wait_for_work(&thread_info);
 
     if (thread_info._ssn != nullptr) {
-      Run_Session(*thread_info._ssn, Target[target_index], Target_Https[target_https_index]);
-      if (++target_index >= Target.size())
-        target_index = 0;
-      if (++target_https_index >= Target_Https.size())
-        target_https_index = 0;
+      Run_Session(*thread_info._ssn, Target_Selector);
     }
   }
 }
@@ -473,8 +611,8 @@ Engine::command_run()
   auto args{arguments.get("run")};
   swoc::Errata errata;
 
-  if (args.size() < 3) {
-    errata.error(R"(Not enough arguments for "{}" command.\n{})", COMMAND_RUN, COMMAND_RUN_ARGS);
+  if (args.size() < 1) {
+    errata.error(R"("run" command requires a directory path as an argument.)");
     process_exit_code = 1;
     return;
   }
@@ -490,15 +628,38 @@ Engine::command_run()
     Use_Strict_Checking = true;
   }
 
-  errata.note(resolve_ips(args[1], Target));
-  if (!errata.is_ok()) {
+  auto server_addr_http_arg{arguments.get("connect-http")};
+  auto server_addr_https_arg{arguments.get("connect-https")};
+  auto server_addr_http3_arg{arguments.get("connect-http3")};
+  if (!server_addr_http_arg && !server_addr_https_arg && !server_addr_http3_arg) {
+    errata.error(
+        R"(Must provide at least one of "--connect-http", "--connect-https", or "--connect-http3" arguments")");
     process_exit_code = 1;
     return;
   }
-  errata.note(resolve_ips(args[2], Target_Https));
-  if (!errata.is_ok()) {
-    process_exit_code = 1;
-    return;
+
+  if (server_addr_http_arg) {
+    errata.note(resolve_ips(server_addr_http_arg[0], Target_Selector.http_targets));
+    if (!errata.is_ok()) {
+      process_exit_code = 1;
+      return;
+    }
+  }
+
+  if (server_addr_https_arg) {
+    errata.note(resolve_ips(server_addr_https_arg[0], Target_Selector.https_targets));
+    if (!errata.is_ok()) {
+      process_exit_code = 1;
+      return;
+    }
+  }
+
+  if (server_addr_http3_arg) {
+    errata.note(resolve_ips(server_addr_http3_arg[0], Target_Selector.http3_targets));
+    if (!errata.is_ok()) {
+      process_exit_code = 1;
+      return;
+    }
   }
 
   auto key_format_arg{arguments.get("format")};
@@ -520,7 +681,7 @@ Engine::command_run()
   if (ca_certs_arg.size() >= 1) {
     errata.note(TLSSession::configure_ca_cert(ca_certs_arg[0]));
     if (!errata.is_ok()) {
-      errata.error(R"(Invalid ca-certs path "{}")", cert_arg[0]);
+      errata.error(R"(Invalid ca-certs path "{}")", ca_certs_arg[0]);
       process_exit_code = 1;
       return;
     }
@@ -531,6 +692,16 @@ Engine::command_run()
     for (auto const &key : keys_arg) {
       Keys_Whitelist.insert(key);
     }
+  }
+
+  auto interface_arg{arguments.get("interface")};
+  if (interface_arg.size() > 1) {
+    errata.error(R"("interface" command requires exactly one device name as an argument.)");
+    process_exit_code = 1;
+    return;
+  } else if (!interface_arg.empty()) {
+    // Copy to global TextView, function does not terminate until joining
+    specified_interface = interface_arg[0];
   }
 
   errata.info(R"(Loading replay data from "{}".)", args[0]);
@@ -563,11 +734,45 @@ Engine::command_run()
   errata.info("Parsed {} transactions in {} sessions.", transaction_count, session_count);
   HttpHeader::set_max_content_length(max_content_length);
 
-  Session::init(transaction_count);
+  errata.note(Session::init(transaction_count));
+  if (!errata.is_ok()) {
+    return;
+  }
+
   errata.diag(R"(Initializing TLS)");
-  TLSSession::init();
+  auto tls_secrets_log_file_arg{arguments.get("tls-secrets-log-file")};
+  std::string tls_secrets_log_file;
+  if (tls_secrets_log_file_arg) {
+    tls_secrets_log_file = tls_secrets_log_file_arg[0];
+  }
+  errata.note(TLSSession::init(tls_secrets_log_file));
+  if (!errata.is_ok()) {
+    return;
+  }
+
   errata.diag(R"(Initialize H2)");
-  H2Session::init(&process_exit_code);
+  errata.note(H2Session::init(&process_exit_code));
+  if (!errata.is_ok()) {
+    TLSSession::terminate();
+    return;
+  }
+
+  errata.diag(R"(Initialize H3)");
+  auto qlog_dir_arg{arguments.get("qlog-dir")};
+  std::string qlog_dir;
+  if (qlog_dir_arg) {
+    qlog_dir = qlog_dir_arg[0];
+  }
+  errata.note(H3Session::init(&process_exit_code, qlog_dir));
+  if (!errata.is_ok()) {
+    TLSSession::terminate();
+    H2Session::terminate();
+    return;
+  }
+
+  if (!errata.is_ok()) {
+    return;
+  }
 
   auto sleep_limit_arg{arguments.get("sleep-limit")};
   microseconds sleep_limit = 500ms;
@@ -674,7 +879,9 @@ Engine::command_run()
   for (int i = 0; i < repeat_count; i++) {
     auto const this_iteration_start_time = ClockType::now();
     for (auto ssn : Session_List) {
-      if (use_sleep_time) {
+      if (ssn->_user_specified_delay_duration > 0us) {
+        sleep_for(ssn->_user_specified_delay_duration);
+      } else if (use_sleep_time) {
         sleep_for(sleep_time);
         // Transactions will be run with no rate limiting.
       } else if (rate_multiplier != 0) {
@@ -718,6 +925,7 @@ Engine::command_run()
 
   TLSSession::terminate();
   H2Session::terminate();
+  H3Session::terminate();
 };
 
 int
@@ -751,16 +959,52 @@ main(int /* argc */, char const *argv[])
 
   engine.parser
       .add_command(
-          Engine::COMMAND_RUN.data(),
-          Engine::COMMAND_RUN_ARGS.data(),
+          "run",
+          "run <path>: the file path or directory containing replay file(s).",
           "",
-          MORE_THAN_ONE_ARG_N,
+          1,
           [&]() -> void { engine.command_run(); })
+      .add_option(
+          "--connect-http",
+          "",
+          "HTTP address and port to connect on. Can be a comma separated list.",
+          "",
+          1,
+          "")
+      .add_option(
+          "--connect-https",
+          "",
+          "TLS address and port to connect on. Can be a comma separated list.",
+          "",
+          1,
+          "")
+      .add_option(
+          "--connect-http3",
+          "",
+          "HTTP/3 address and port to connect on. Can be a comma separated list.",
+          "",
+          1,
+          "")
+      .add_option(
+          "--qlog-dir",
+          "",
+          "The directory in which to store QUIC log files. By default no QUIC "
+          "logging is performed.",
+          "",
+          1,
+          "")
       .add_option("--no-proxy", "", "Use proxy data instead of client data.")
+      .add_option(
+          "--interface",
+          "-i",
+          "Specify the network device the client will establish connections from.",
+          "",
+          1,
+          "")
       .add_option(
           "--repeat",
           "",
-          "Specify a number of times to repeat replaying the data set.",
+          "Specify the number of times to repeat replaying the data set.",
           "",
           1,
           "")
@@ -808,6 +1052,14 @@ main(int /* argc */, char const *argv[])
           1,
           "")
       .add_option(
+          "--tls-secrets-log-file",
+          "",
+          "A filename to which TLS secrets will be logged. These can be used to "
+          "decrypt packet captures. By default no TLS secrets will be logged.",
+          "",
+          1,
+          "")
+      .add_option(
           "--keys",
           "-k",
           "A whitelist of transactions to send.",
@@ -822,6 +1074,7 @@ main(int /* argc */, char const *argv[])
   if (const auto verbose_argument{engine.arguments.get("verbose")}; verbose_argument) {
     verbosity = verbose_argument.value();
   }
+  HttpHeader::global_init();
   if (!configure_logging(verbosity)) {
     std::cerr << "Unrecognized verbosity option: " << verbosity << std::endl;
     return 1;
